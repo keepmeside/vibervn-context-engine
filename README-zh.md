@@ -27,6 +27,16 @@ npm install -g vibervn-context-engine@latest
 vibervn-context-engine --port 6699
 ```
 
+对于 Codex、Claude Code、Cursor 以及其他以子进程启动 MCP 的客户端，可使用 stdio：
+
+```bash
+vibervn-context-engine --mcp-stdio
+```
+
+`ask-context` 可选调用 TypeSafe System One。设置 `TYPESAFE_API_KEY` 后启用
+`jev-latest`；也可通过 `TYPESAFE_API_URL`、`TYPESAFE_MODEL` 和
+`TYPESAFE_TIMEOUT_MS` 覆盖默认值。没有密钥时仍使用本地决策。
+
 支持的平台：Linux x64/arm64、macOS arm64、Windows x64。
 
 ## 功能特性
@@ -34,6 +44,7 @@ vibervn-context-engine --port 6699
 | 功能 | 描述 |
 |------|------|
 | 语义代码搜索 | 通过嵌入向量按语义查找代码，而非字面文本匹配 |
+| 混合检索 | 将向量检索与有界 lexical matching 结合，保留精确符号、路径和错误字符串 |
 | 多语言解析 | 使用 Tree-sitter 为 22 种语言提取符号（见下表） |
 | 调用图扩展 | 解析调用方/被调方边，并在查询时对匹配符号进行 BFS 扩展 |
 | Import 路径解析 | 为 TS/JS、Python、Go、Rust 追踪 import 到实际文件 —— 解析 name matching 遗漏的跨模块调用 |
@@ -45,9 +56,10 @@ vibervn-context-engine --port 6699
 | 实时文件监听 | `notify`（带去抖）在文件变更时自动触发重新索引 |
 | Voyage AI 嵌入 | 带磁盘缓存的 HTTP 嵌入客户端，避免重复 API 调用 |
 | LLM 重排序 | 使用 LLM（OpenAI / Google）对候选片段重新排序；可选，可禁用 |
+| 结构化 Ask 决策 | `ask-context` 返回 JSON evidence、源码有效性、confidence、uncertainty 和降级警告；配置 TypeSafe 后还会返回 noul/choice/score typed answers |
 | 内嵌 SurrealDB | 存储片段、符号和边；每个仓库一个数据存储 |
 | HTTP API + Web 界面 | 配置管理、索引浏览器和查询测试控制台 |
-| MCP 服务器 | 通过可流式 HTTP 暴露 `codebase-retrieval` 和 `file-retrieval` 工具 |
+| MCP 服务器 | 通过可流式 HTTP 或 stdio 暴露文本检索和结构化 `ask-context` 工具 |
 | SSE 进度流 | 将实时索引进度事件流式传输到界面 |
 | 大型仓库扩展 | 内存有界且无 O(n²) 路径 —— 为 Linux/Chromium 规模的代码库而构建 |
 

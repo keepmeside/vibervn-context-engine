@@ -1348,6 +1348,12 @@ impl IndexPipeline {
             return Err(e);
         }
 
+        // The changed-file edge set is resolved and unaffected calls remain
+        // intact, so the committed index has a complete graph marker.
+        set_meta(db, EDGES_RESOLVED_KEY, "1")
+            .await
+            .context("commit edges_resolved marker")?;
+
         Ok((run_stats, vi_apply_ms))
     }
 
@@ -2972,11 +2978,10 @@ impl IndexPipeline {
     ///   3. Re-resolve raw_edge rows WHERE from_file IN resolve_set via keyset
     ///      pagination (uses idx_raw_edge_from_file).
     ///
-    /// The `edges_resolved` crash-recovery marker is NOT written here — it is only
-    /// meaningful for a full rebuild where ALL raw_edge must be re-resolved on crash
-    /// recovery. Incremental is already idempotent: if it crashes before file_meta
-    /// is written (the crash-safe anchor in streaming_index), the whole incremental
-    /// re-runs on next trigger, including this method.
+    /// The `edges_resolved` marker is stamped by `incremental_run` only after this
+    /// scoped resolution succeeds. Incremental is idempotent: if it crashes before
+    /// file_meta is written (the crash-safe anchor in `streaming_index`), the whole
+    /// incremental re-runs on the next trigger, including this method.
     async fn resolve_edges_incremental(
         &self,
         db: &Surreal<Db>,

@@ -29,6 +29,18 @@ npm install -g vibervn-context-engine@latest
 vibervn-context-engine --port 6699
 ```
 
+For Codex, Claude Code, Cursor, and other subprocess-launched MCP clients, run
+the stdio transport instead of the HTTP server:
+
+```bash
+vibervn-context-engine --mcp-stdio
+```
+
+`ask-context` can optionally add TypeSafe System One judgments. Set
+`TYPESAFE_API_KEY` to enable the real `jev-latest` API; `TYPESAFE_API_URL`,
+`TYPESAFE_MODEL`, and `TYPESAFE_TIMEOUT_MS` are optional overrides. Without a
+key, the local retrieval decision remains active.
+
 Supported platforms: Linux x64/arm64, macOS arm64, Windows x64.
 
 ## Features
@@ -36,6 +48,7 @@ Supported platforms: Linux x64/arm64, macOS arm64, Windows x64.
 | Feature | Description |
 |---------|-------------|
 | Semantic code search | Finds code by meaning via embeddings, not literal text matching |
+| Hybrid retrieval | Fuses semantic vectors with bounded lexical matching for exact symbols, paths, and error strings |
 | Multi-language parsing | Tree-sitter symbol extraction for 22 languages (see table below) |
 | Call-graph expansion | Resolves caller/callee edges and BFS-expands matched symbols at query time |
 | Import-path resolution | Traces imports to actual files for TS/JS, Python, Go, and Rust — resolves cross-module calls that name matching misses |
@@ -47,9 +60,10 @@ Supported platforms: Linux x64/arm64, macOS arm64, Windows x64.
 | Real-time file watching | `notify` (debounced) triggers re-index automatically on file changes |
 | Voyage AI embeddings | HTTP embedding client with an on-disk cache to avoid redundant API calls |
 | LLM reranking | Reorders candidate chunks with an LLM (OpenAI / Google); optional, can be disabled |
+| Structured Ask decisions | `ask-context` returns JSON evidence, source validity, confidence, uncertainty, and degradation warnings; TypeSafe adds typed noul/choice/score answers when configured |
 | Embedded SurrealDB | Stores chunks, symbols, and edges; one datastore per repo |
 | HTTP API + Web UI | Settings management, index explorer, and a query test console |
-| MCP server | Exposes `codebase-retrieval` and `file-retrieval` tools over streamable HTTP |
+| MCP server | Exposes text retrieval plus structured `ask-context` over streamable HTTP or stdio |
 | SSE progress stream | Streams live indexing progress events to the UI |
 | Large-repo scaling | Bounded memory and no O(n²) paths — built for Linux/Chromium-scale codebases |
 
@@ -111,14 +125,16 @@ flowchart TD
 
     Clients --> QF[Parse field filters: kind:/lang:/path:/name:]
     QF --> Q1[Embed remaining query text]
-    Q1 --> Q2[Vector search: top-k cosine]
-    Q2 -.reads.-> VecIndex
+    Q1 --> Q2[Hybrid retrieval: vector + lexical]
+    Q2 -.semantic reads.-> VecIndex
+    Q2 -.lexical reads.-> Store
     Q2 --> Q3[Apply filters + downrank generated files]
     Q3 --> Q4[Graph expand: BFS callers/callees]
     Q4 --> Q5[Merge + dedup adjacent ranges]
     Q5 --> Q6[LLM rerank]
     Q6 --> Q7[Format: path#Lstart-end + caller/callee names + numbered lines]
-    Q7 --> Result([Results])
+    Q7 --> Decision[Typed decision: action + confidence + evidence validity]
+    Decision --> Result([Results])
 ```
 
 ## Contributing

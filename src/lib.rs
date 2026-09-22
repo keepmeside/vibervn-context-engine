@@ -18,6 +18,7 @@ pub mod query;
 pub mod router;
 pub mod server;
 pub mod store;
+pub mod typesafe;
 pub mod vector;
 
 /// Check whether `file` belongs to the repository rooted at `repo`.
