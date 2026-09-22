@@ -9,7 +9,7 @@ use serde_json::Value;
 use tempfile::NamedTempFile;
 
 /// Bump this when a new migration is appended to MIGRATIONS.
-pub const CURRENT_VERSION: u32 = 13;
+pub const CURRENT_VERSION: u32 = 14;
 
 /// Migration function type: transforms a JSON Value from version N to version N+1.
 pub type MigrationFn = fn(Value) -> Result<Value, ConfigError>;
@@ -29,6 +29,7 @@ pub const MIGRATIONS: &[MigrationFn] = &[
     migrate_v10_to_v11,
     migrate_v11_to_v12,
     migrate_v12_to_v13,
+    migrate_v13_to_v14,
 ];
 
 /// v1→v2: introduce `data_dir` (Option<PathBuf>). The body is a no-op stamp —
@@ -196,6 +197,35 @@ fn migrate_v12_to_v13(mut value: Value) -> Result<Value, ConfigError> {
         && let Some(Value::Array(tools)) = obj.get_mut("enabled_mcp_tools")
     {
         tools.retain(|tool| tool.as_str() != Some("file-retrieval"));
+    }
+    Ok(value)
+}
+
+/// v13→v14: expose the structured Ask workflow by default. Existing users who
+/// had an explicit MCP allowlist keep their choices plus the new read-only tool;
+/// fresh installs get it from `default_enabled_mcp_tools`.
+fn migrate_v13_to_v14(mut value: Value) -> Result<Value, ConfigError> {
+    if let Value::Object(ref mut obj) = value {
+        match obj.get_mut("enabled_mcp_tools") {
+            Some(Value::Array(tools)) => {
+                if !tools.is_empty()
+                    && !tools
+                        .iter()
+                        .any(|tool| tool.as_str() == Some("ask-context"))
+                {
+                    tools.push(Value::String("ask-context".to_string()));
+                }
+            }
+            _ => {
+                obj.insert(
+                    "enabled_mcp_tools".to_string(),
+                    Value::Array(vec![
+                        Value::String("codebase-retrieval".to_string()),
+                        Value::String("ask-context".to_string()),
+                    ]),
+                );
+            }
+        }
     }
     Ok(value)
 }
@@ -430,9 +460,9 @@ fn default_mcp_stale_after_days() -> u64 {
 }
 
 fn default_enabled_mcp_tools() -> Vec<String> {
-    // Only `codebase-retrieval` is on by default. `file-retrieval` is an
-    // advanced, opt-in tool — new installs must enable it explicitly in the UI.
-    vec!["codebase-retrieval".to_string()]
+    // `file-retrieval` remains advanced and opt-in. The structured Ask tool is
+    // read-only and is the default machine-readable entry point for new installs.
+    vec!["codebase-retrieval".to_string(), "ask-context".to_string()]
 }
 
 /// A plan/key the user has bought (or claimed as a free trial) through the buy
@@ -1843,8 +1873,8 @@ mod tests {
         assert_eq!(loaded.version, CURRENT_VERSION);
         assert_eq!(
             loaded.enabled_mcp_tools,
-            vec!["codebase-retrieval".to_string()],
-            "file-retrieval must be removed from enabled tools on upgrade"
+            vec!["codebase-retrieval".to_string(), "ask-context".to_string()],
+            "file-retrieval must be removed and structured Ask enabled on upgrade"
         );
 
         let raw = fs::read_to_string(&path).expect("re-read");
@@ -1880,12 +1910,15 @@ mod tests {
         assert_eq!(tools, vec!["codebase-retrieval".to_string()]);
     }
 
-    /// New installs default to `codebase-retrieval` only; `file-retrieval` is
-    /// opt-in and must NOT appear in the default tool list.
+    /// New installs enable `codebase-retrieval` and structured Ask;
+    /// `file-retrieval` remains opt-in and must NOT appear in the default list.
     #[test]
     fn test_default_enabled_mcp_tools_excludes_file_retrieval() {
         let tools = default_enabled_mcp_tools();
-        assert_eq!(tools, vec!["codebase-retrieval".to_string()]);
+        assert_eq!(
+            tools,
+            vec!["codebase-retrieval".to_string(), "ask-context".to_string()]
+        );
         assert!(
             !tools.iter().any(|t| t == "file-retrieval"),
             "file-retrieval must not be enabled by default"
@@ -1983,9 +2016,30 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_v13_to_v14_adds_structured_ask_without_clobbering_allowlists() {
+        let value: Value =
+            serde_json::from_str(r#"{"enabled_mcp_tools":["codebase-retrieval","custom-tool"]}"#)
+                .expect("parse");
+        let migrated = migrate_v13_to_v14(value).expect("migrate");
+        let tools = migrated["enabled_mcp_tools"].as_array().expect("array");
+        assert_eq!(tools[0], "codebase-retrieval");
+        assert_eq!(tools[1], "custom-tool");
+        assert_eq!(tools[2], "ask-context");
+
+        let empty: Value = serde_json::from_str(r#"{"enabled_mcp_tools":[]}"#).expect("parse");
+        let empty = migrate_v13_to_v14(empty).expect("migrate empty");
+        assert!(
+            empty["enabled_mcp_tools"]
+                .as_array()
+                .expect("array")
+                .is_empty()
+        );
+    }
+
     /// v12→v13 with a MISSING `enabled_mcp_tools` field: the migration is a
-    /// no-op (nothing to strip), and serde fills the new opt-in default
-    /// (codebase-retrieval only) on deserialize.
+    /// no-op (nothing to strip), and serde fills the structured Ask default on
+    /// deserialize.
     #[test]
     fn test_v12_to_v13_missing_field_defaults_to_codebase_only() {
         let home = TempDir::new().expect("tempdir");
@@ -2004,8 +2058,8 @@ mod tests {
         let loaded = ensure_dir_and_load(home.path()).expect("load v12 missing tools");
         assert_eq!(
             loaded.enabled_mcp_tools,
-            vec!["codebase-retrieval".to_string()],
-            "missing enabled_mcp_tools must default to codebase-retrieval only"
+            vec!["codebase-retrieval".to_string(), "ask-context".to_string()],
+            "missing enabled_mcp_tools must include the default structured Ask tool"
         );
     }
 
@@ -2035,7 +2089,7 @@ mod tests {
         );
     }
 
-    /// One-time-only guard: once a file is at CURRENT_VERSION (v13), loading it
+    /// One-time-only guard: once a file is at CURRENT_VERSION, loading it
     /// does NOT re-run the migration. A user who deliberately RE-ENABLES
     /// file-retrieval after the upgrade keeps it — the migration never strips it
     /// again. Also proves the on-disk file is untouched (no rewrite) on a

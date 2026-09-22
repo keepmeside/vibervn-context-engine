@@ -30,6 +30,17 @@ npm install -g vibervn-context-engine@latest
 vibervn-context-engine --port 6699
 ```
 
+Để kết nối Codex, Claude Code, Cursor hoặc MCP client chạy dưới dạng subprocess,
+dùng transport stdio:
+
+```bash
+vibervn-context-engine --mcp-stdio
+```
+
+`ask-context` có thể gọi thêm System One của TypeSafe. Đặt `TYPESAFE_API_KEY` để
+bật API `jev-latest`; có thể ghi đè bằng `TYPESAFE_API_URL`, `TYPESAFE_MODEL` và
+`TYPESAFE_TIMEOUT_MS`. Nếu không có key, quyết định local vẫn hoạt động.
+
 Nền tảng được hỗ trợ: Linux x64/arm64, macOS arm64, Windows x64.
 
 ## Tính năng
@@ -37,6 +48,7 @@ Nền tảng được hỗ trợ: Linux x64/arm64, macOS arm64, Windows x64.
 | Tính năng | Mô tả |
 |-----------|-------|
 | Semantic code search | Tìm mã theo ý nghĩa thông qua embedding, không khớp văn bản thuần |
+| Hybrid retrieval | Kết hợp vector semantic với lexical matching có giới hạn để bắt exact symbol, path và error string |
 | Multi-language parsing | Extract symbol bằng Tree-sitter cho 22 ngôn ngữ (xem bảng bên dưới) |
 | Call-graph expansion | Resolve caller/callee edge và BFS expand các symbol khớp khi query |
 | Import-path resolution | Trace import tới file thật cho TS/JS, Python, Go, Rust — resolve cross-module call mà name matching bỏ lỡ |
@@ -48,9 +60,10 @@ Nền tảng được hỗ trợ: Linux x64/arm64, macOS arm64, Windows x64.
 | Real-time file watching | `notify` (debounce) tự động trigger re-index khi tệp thay đổi |
 | Voyage AI embedding | HTTP embedding client có disk cache để tránh gọi API thừa |
 | LLM rerank | Sắp xếp lại các candidate chunk bằng LLM (OpenAI / Google); tùy chọn, có thể tắt |
+| Structured Ask decision | `ask-context` trả JSON gồm evidence, trạng thái source, confidence, uncertainty và cảnh báo degradation; TypeSafe bổ sung answer noul/choice/score khi được cấu hình |
 | Embedded SurrealDB | Lưu chunk, symbol và edge; một datastore cho mỗi repo |
 | HTTP API + Web UI | Quản lý cấu hình, index explorer và bảng điều khiển thử query |
-| MCP server | Cung cấp `codebase-retrieval` và `file-retrieval` tool qua streamable HTTP |
+| MCP server | Cung cấp retrieval dạng text và `ask-context` dạng cấu trúc qua streamable HTTP hoặc stdio |
 | SSE progress stream | Truyền sự kiện indexing progress trực tiếp tới UI |
 | Large-repo scaling | Bounded memory và không có đường O(n²) — xây dựng cho codebase quy mô Linux/Chromium |
 
@@ -110,13 +123,15 @@ flowchart TD
     end
 
     Clients --> Q1[Embed query]
-    Q1 --> Q2[Vector search: top-k cosine]
-    Q2 -.reads.-> VecIndex
+    Q1 --> Q2[Hybrid retrieval: vector + lexical]
+    Q2 -.semantic reads.-> VecIndex
+    Q2 -.lexical reads.-> Store
     Q2 --> Q3[Graph expand: BFS caller/callee]
     Q3 --> Q4[Merge + dedup adjacent range]
     Q4 --> Q5[LLM rerank]
     Q5 --> Q6[Format: path#Lstart-end + dòng đánh số]
-    Q6 --> Result([Kết quả])
+    Q6 --> Decision[Typed decision: action + confidence + evidence validity]
+    Decision --> Result([Kết quả])
 ```
 
 ## Đóng góp

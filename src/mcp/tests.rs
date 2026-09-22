@@ -29,6 +29,25 @@ fn vector_only_fast_path_only_for_resolve_edges() {
 }
 
 #[test]
+fn ask_context_arguments_are_machine_readable() {
+    let args: AskContextArgs = serde_json::from_value(serde_json::json!({
+        "workspace_full_path": "/repo",
+        "query": "where is authentication handled?",
+        "effort": "medium"
+    }))
+    .expect("ask-context arguments should decode");
+    assert_eq!(args.workspace_full_path, "/repo");
+    assert_eq!(args.effort.as_deref(), Some("medium"));
+}
+
+#[test]
+fn ask_context_result_populates_native_structured_content() {
+    let result = ask_context_call_result(r#"{"schema_version":1}"#.to_owned());
+    assert_eq!(result.is_error, Some(false));
+    assert!(result.structured_content.is_some());
+}
+
+#[test]
 fn file_retrieval_db_key_windows_backslash_input() {
     let repo = r"D:\projects\Python\local-context-engine";
     let file_path = r"context-engine-rs\Cargo.toml";

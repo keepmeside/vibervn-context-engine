@@ -1,0 +1,5 @@
+Use this tool for broad codebase questions, architecture investigations, impact analysis, and comparisons.
+It returns JSON with `results`, source `evidence`, and a typed `decision` containing an action, confidence, uncertainty, and the signals behind that decision.
+Treat `confidence_kind=local_heuristic` as a routing signal rather than a calibrated probability. If the action is `need_more_evidence`, follow up with targeted retrieval or a direct file read.
+The `effort` value controls the bounded candidate budget: `min`, `medium`, or `high`.
+When configured with `TYPESAFE_API_KEY`, the response also includes TypeSafe's typed `noul`, `score`, and `choice` judgments under `typesafe`; this enrichment is optional and local evidence remains the fallback.

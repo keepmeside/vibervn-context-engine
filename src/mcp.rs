@@ -308,6 +308,16 @@ pub struct FileRetrievalArgs {
     pub top_k: Option<usize>,
 }
 
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct AskContextArgs {
+    /// Absolute path to the repository root.
+    pub workspace_full_path: String,
+    /// A concrete question or investigation objective.
+    pub query: String,
+    /// Bounded retrieval effort. Defaults to `min`.
+    pub effort: Option<String>,
+}
+
 // ─── MCP handler ─────────────────────────────────────────────────────────
 
 #[derive(Clone)]
@@ -337,7 +347,7 @@ impl McpHandler {
         settings: Arc<RwLock<crate::config::Settings>>,
         enabled_tools: &[String],
     ) -> Self {
-        let all_tools: &[&str] = &["codebase-retrieval", "file-retrieval"];
+        let all_tools: &[&str] = &["codebase-retrieval", "file-retrieval", "ask-context"];
         let mut router = Self::tool_router();
         for &name in all_tools {
             if !enabled_tools.iter().any(|e| e == name) {
@@ -415,6 +425,34 @@ impl McpHandler {
         .await;
         Ok(CallToolResult::success(vec![Content::text(text)]))
     }
+
+    #[doc = include_str!("prompts/mcp_ask_context.txt")]
+    #[tool(name = "ask-context")]
+    async fn ask_context(
+        &self,
+        Parameters(args): Parameters<AskContextArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let settings = self.settings.read().await.clone();
+        let text = with_progress_heartbeat(
+            ctx.peer,
+            &ctx.meta,
+            ctx.ct,
+            MCP_PROGRESS_HEARTBEAT,
+            run_ask_context(
+                &self.home_dir,
+                &self.data_dir,
+                &self.index_engine,
+                &self.repo_dbs,
+                &settings,
+                &args.query,
+                &args.workspace_full_path,
+                args.effort.as_deref().unwrap_or("min"),
+            ),
+        )
+        .await;
+        Ok(ask_context_call_result(text))
+    }
 }
 
 #[tool_handler(router = self.tool_router)]
@@ -446,6 +484,14 @@ pub struct RepoFileRetrievalArgs {
     pub top_k: Option<usize>,
 }
 
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct RepoAskContextArgs {
+    /// A concrete question or investigation objective.
+    pub query: String,
+    /// Bounded retrieval effort. Defaults to `min`.
+    pub effort: Option<String>,
+}
+
 #[derive(Clone)]
 pub struct RepoMcpHandler {
     home_dir: PathBuf,
@@ -469,7 +515,7 @@ impl RepoMcpHandler {
         settings: Arc<RwLock<crate::config::Settings>>,
         enabled_tools: &[String],
     ) -> Self {
-        let all_tools: &[&str] = &["codebase-retrieval", "file-retrieval"];
+        let all_tools: &[&str] = &["codebase-retrieval", "file-retrieval", "ask-context"];
         let mut router = Self::tool_router();
         for &name in all_tools {
             if !enabled_tools.iter().any(|e| e == name) {
@@ -539,6 +585,34 @@ impl RepoMcpHandler {
         )
         .await;
         Ok(CallToolResult::success(vec![Content::text(text)]))
+    }
+
+    #[doc = include_str!("prompts/mcp_ask_context.txt")]
+    #[tool(name = "ask-context")]
+    async fn ask_context(
+        &self,
+        Parameters(args): Parameters<RepoAskContextArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let settings = self.settings.read().await.clone();
+        let text = with_progress_heartbeat(
+            ctx.peer,
+            &ctx.meta,
+            ctx.ct,
+            MCP_PROGRESS_HEARTBEAT,
+            run_ask_context(
+                &self.home_dir,
+                &self.data_dir,
+                &self.index_engine,
+                &self.repo_dbs,
+                &settings,
+                &args.query,
+                &self.repo_path,
+                args.effort.as_deref().unwrap_or("min"),
+            ),
+        )
+        .await;
+        Ok(ask_context_call_result(text))
     }
 }
 
@@ -727,6 +801,245 @@ fn build_augmented_query(
     }
 }
 
+#[derive(Debug, serde::Serialize)]
+struct AskContextResponse {
+    schema_version: u32,
+    workspace: String,
+    query: String,
+    effort: String,
+    results: Vec<crate::query::engine::CodeResult>,
+    evidence: Vec<crate::query::decision::EvidenceRecord>,
+    decision: crate::query::decision::RetrievalDecision,
+    typesafe: Option<crate::typesafe::TypeSafeResponse>,
+    timing: crate::query::engine::QueryTiming,
+    warnings: Vec<String>,
+}
+
+/// Preserve the human-readable JSON text while also filling MCP's native
+/// `structuredContent` field for clients that can consume typed tool results.
+fn ask_context_call_result(text: String) -> CallToolResult {
+    match serde_json::from_str::<serde_json::Value>(&text) {
+        Ok(value) if value.get("error").is_some() => CallToolResult::structured_error(value),
+        Ok(value) => CallToolResult::structured(value),
+        Err(_) => CallToolResult::error(vec![Content::text(text)]),
+    }
+}
+
+fn build_typesafe_state(
+    query: &str,
+    result: &crate::query::engine::QueryResult,
+) -> serde_json::Value {
+    let results: Vec<serde_json::Value> = result
+        .results
+        .iter()
+        .take(12)
+        .map(|item| {
+            serde_json::json!({
+                "file": item.file,
+                "line_start": item.line_start,
+                "line_end": item.line_end,
+                "score": item.score,
+                "symbol": item.symbol,
+                "content": item.content.chars().take(1200).collect::<String>(),
+            })
+        })
+        .collect();
+    crate::typesafe::bounded_state(
+        serde_json::json!({
+            "query": query,
+            "results": results,
+            "evidence": result.evidence,
+            "local_decision": result.decision,
+        }),
+        24_000,
+    )
+}
+
+/// Structured, machine-readable Ask workflow. The response is intentionally a
+/// fixed JSON schema so an agent can branch on `decision.action` and confidence
+/// without parsing the legacy text output from `codebase-retrieval`.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_ask_context(
+    home_dir: &Path,
+    data_dir: &Path,
+    index_engine: &Arc<IndexEngine>,
+    repo_dbs: &Arc<RwLock<HashMap<String, Surreal<Db>>>>,
+    settings: &Settings,
+    query: &str,
+    workspace_full_path: &str,
+    effort: &str,
+) -> String {
+    let query = query.trim();
+    let repo = workspace_full_path.trim();
+    if query.is_empty() {
+        return serde_json::json!({ "error": "query is required" }).to_string();
+    }
+    if repo.is_empty() {
+        return serde_json::json!({ "error": "workspace_full_path is required" }).to_string();
+    }
+    let effort = effort.trim().to_lowercase();
+    let top_k = match effort.as_str() {
+        "min" => 12,
+        "medium" => 24,
+        "high" => 40,
+        _ => {
+            return serde_json::json!({
+                "error": "effort must be one of: min, medium, high"
+            })
+            .to_string();
+        }
+    };
+
+    let repo = crate::store::normalize_repo_path(repo);
+    if !settings.repos.iter().any(|configured| configured == &repo) {
+        if !Path::new(&repo).is_dir() {
+            return serde_json::json!({
+                "error": format!("workspace '{repo}' does not exist or is not a directory")
+            })
+            .to_string();
+        }
+        // Match codebase-retrieval's ergonomic auto-registration. The index
+        // watcher is started immediately; persistence is best-effort.
+        index_engine.register_repo(&repo).await;
+        if let Ok(mut disk) = crate::config::ensure_dir_and_load(home_dir)
+            && !disk.repos.iter().any(|configured| configured == &repo)
+        {
+            disk.repos.push(repo.clone());
+            disk.version = crate::config::CURRENT_VERSION;
+            let target = crate::config::config_path(home_dir);
+            let _ = crate::config::write_settings_atomic(&target, &disk);
+        }
+    }
+
+    if settings.embedding.api_keys.is_empty() {
+        return serde_json::json!({
+            "error": "no embedding API keys configured"
+        })
+        .to_string();
+    }
+
+    let (graph_mode, warm_budget) =
+        match readiness::await_index_ready(settings, index_engine, repo_dbs, data_dir, &repo).await
+        {
+            readiness::IndexReadiness::Ready { warm_budget } => (QueryGraphMode::Full, warm_budget),
+            readiness::IndexReadiness::ReadyVectorOnly { warm_budget } => {
+                (QueryGraphMode::VectorOnly, warm_budget)
+            }
+            readiness::IndexReadiness::Timeout => {
+                return serde_json::json!({
+                    "error": "index is still warming; retry this request",
+                    "decision": { "action": "retry_index" }
+                })
+                .to_string();
+            }
+            readiness::IndexReadiness::Failed(error) => {
+                return serde_json::json!({ "error": format!("index readiness failed: {error:#}") })
+                .to_string();
+            }
+        };
+
+    let voyage_client = match VoyageClient::new_for_provider(
+        crate::embedding::voyage::Provider::parse(&settings.embedding.provider),
+        settings.embedding.model.clone(),
+        settings.embedding.api_keys.clone(),
+        settings.embedding.voyage_base_url.as_deref(),
+        settings.embedding.dimensions,
+    ) {
+        Ok(client) => client,
+        Err(error) => {
+            return serde_json::json!({
+                "error": format!("failed to create embedding client: {error}")
+            })
+            .to_string();
+        }
+    };
+    let llm_client = LlmClient::new(&settings.llm);
+
+    let result = match crate::query::engine::run_query_with_filters_and_mode(
+        query,
+        top_k,
+        Some(&repo),
+        &voyage_client,
+        index_engine,
+        repo_dbs,
+        settings.llm.rerank_min_prune_lines,
+        llm_client.as_ref(),
+        warm_budget,
+        settings.llm.agentic_rag,
+        settings.llm.agentic_rag_max_turns,
+        settings.llm.agentic_rag_max_chunk_chars,
+        settings.llm.agentic_rag_grep_read,
+        None,
+        graph_mode,
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(error) => {
+            return serde_json::json!({ "error": format!("query failed: {error}") }).to_string();
+        }
+    };
+
+    let mut warnings = Vec::new();
+    let typesafe = match crate::typesafe::TypeSafeClient::from_env() {
+        Ok(Some(client)) => match client
+            .evaluate(
+                build_typesafe_state(query, &result),
+                crate::typesafe::ask_questions(),
+            )
+            .await
+        {
+            Ok(response) => Some(response),
+            Err(error) => {
+                tracing::warn!(error = %error, "TypeSafe enrichment unavailable; using local Ask decision");
+                warnings.push(
+                    "TypeSafe enrichment was unavailable; local decision was used".to_owned(),
+                );
+                None
+            }
+        },
+        Ok(None) => None,
+        Err(error) => {
+            tracing::warn!(error = %error, "TypeSafe configuration invalid; using local Ask decision");
+            warnings.push("TypeSafe configuration was invalid; local decision was used".to_owned());
+            None
+        }
+    };
+    if result.warming {
+        warnings.push("the index is warming; retry for a complete result set".to_owned());
+    }
+    if result.graph_pending {
+        warnings.push(
+            "call-graph enrichment is pending; vector and lexical evidence is still valid"
+                .to_owned(),
+        );
+    }
+    if result
+        .rerank
+        .as_ref()
+        .is_some_and(|rerank| rerank.fallback_used)
+    {
+        warnings.push("optional reranking was unavailable; local ranking was used".to_owned());
+    }
+
+    let response = AskContextResponse {
+        schema_version: 1,
+        workspace: repo,
+        query: query.to_owned(),
+        effort,
+        results: result.results,
+        evidence: result.evidence,
+        decision: result.decision,
+        typesafe,
+        timing: result.timing,
+        warnings,
+    };
+    serde_json::to_string_pretty(&response).unwrap_or_else(|error| {
+        serde_json::json!({ "error": format!("failed to encode Ask response: {error}") })
+            .to_string()
+    })
+}
+
 /// Format an enriched caller tag: `[callers: fn_a, fn_b, fn_c +N more]`
 /// When callers > 3, shows first 3 names + count of remaining.
 /// Returns empty string when no callers.
@@ -893,11 +1206,18 @@ async fn do_query(
 fn build_db_key(workspace: &str, file_path: &str) -> String {
     let workspace = workspace.trim_end_matches(['/', '\\']);
     let file_path = file_path.trim_start_matches(['/', '\\']);
-    let file_path_native = if cfg!(windows) {
+    // Preserve the path family supplied by the client. MCP callers can ask for
+    // a Windows workspace while the service itself is running on another host
+    // (and the indexed database may have been produced by that client).
+    let windows_style = workspace.contains('\\') || workspace.as_bytes().get(1) == Some(&b':');
+    let file_path_native = if windows_style {
         file_path.replace('/', "\\")
     } else {
         file_path.replace('\\', "/")
     };
+    if windows_style {
+        return format!("{workspace}\\{file_path_native}");
+    }
     let repo_path = std::path::Path::new(workspace);
     let abs_file = repo_path.join(&file_path_native);
     abs_file.to_string_lossy().to_string()

@@ -13,8 +13,10 @@ use crate::embedding::voyage::VoyageClient;
 use crate::indexing::IndexEngine;
 use crate::llm::LlmClient;
 use crate::path_in_repo;
+use crate::query::decision::{self, EvidenceRecord, RetrievalDecision};
 use crate::query::find_db_for_file;
 use crate::query::graph_expand::graph_expand;
+use crate::query::hybrid::{self, LexicalCandidate};
 use crate::query::merger::{MergeChunk, merge_chunks};
 use crate::query::reranker;
 
@@ -82,6 +84,11 @@ impl QueryGraphMode {
 pub struct QueryResult {
     pub results: Vec<CodeResult>,
     pub pre_rerank_results: Vec<CodeResult>,
+    /// Source validity snapshots aligned with `results`.
+    #[serde(default)]
+    pub evidence: Vec<EvidenceRecord>,
+    /// Typed local routing decision for automation clients.
+    pub decision: RetrievalDecision,
     pub timing: QueryTiming,
     pub rerank: Option<RerankInfo>,
     /// True when the target repo's vector shard was not resident after the bounded
@@ -234,7 +241,7 @@ pub(crate) async fn run_query_with_filters_and_mode(
     // Search for 2× top_k so graph expansion has candidates to work with.
     let current_identity = EmbeddingIdentity::from_client(voyage_client);
     let crate::indexing::VectorSearchOutcome {
-        results: raw_results,
+        results: mut raw_results,
         mut warming,
     } = index_engine
         .vector_search(
@@ -245,12 +252,49 @@ pub(crate) async fn run_query_with_filters_and_mode(
             &current_identity,
         )
         .await;
+    // Clone DB handles (Arc-wrapped, cheap) and release the RwLock immediately.
+    // This prevents holding the lock across lexical lookup and graph awaits.
+    let db_map: HashMap<String, Surreal<Db>> = {
+        let guard = repo_dbs.read().await;
+        guard.clone()
+    }; // read lock dropped HERE — before any async DB queries
+
+    // ── Step 2.5: Hybrid lexical retrieval ───────────────────────────────
+    // Search the durable chunk store as a bounded second signal. This recovers
+    // exact names, paths, and error strings that a semantic-only top-k can miss.
+    let lexical_candidates = lexical_candidates(&db_map, repo_filter, embed_query, top_k * 2).await;
     let search_ms = search_start.elapsed().as_millis() as u64;
 
-    if raw_results.is_empty() {
+    // Apply repo filter to vector candidates, then fuse semantic and lexical
+    // scores. Lexical-only hits still enter the normal graph/merge/rerank path.
+    let mut filtered: Vec<_> = if let Some(repo) = repo_filter {
+        raw_results
+            .drain(..)
+            .filter(|r| path_in_repo(&r.chunk_id.file, repo))
+            .collect()
+    } else {
+        raw_results
+    };
+    fuse_retrieval_scores(&mut filtered, lexical_candidates);
+    filtered.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    filtered.truncate(top_k * 2);
+
+    if filtered.is_empty() {
         return Ok(QueryResult {
             results: vec![],
             pre_rerank_results: vec![],
+            evidence: vec![],
+            decision: decision::decide(
+                &[],
+                &[],
+                warming,
+                matches!(graph_mode, QueryGraphMode::VectorOnly),
+                false,
+            ),
             timing: QueryTiming {
                 embed_ms,
                 search_ms,
@@ -265,24 +309,9 @@ pub(crate) async fn run_query_with_filters_and_mode(
         });
     }
 
-    // Apply repo filter.
-    let filtered: Vec<_> = if let Some(repo) = repo_filter {
-        raw_results
-            .into_iter()
-            .filter(|r| path_in_repo(&r.chunk_id.file, repo))
-            .collect()
-    } else {
-        raw_results
-    };
-
     // ── Step 3: Fetch stored content for base chunks ──────────────────────
     // Clone DB handles (Arc-wrapped, cheap) and release the RwLock immediately.
     // This prevents holding the lock across graph expansion await points.
-    let db_map: HashMap<String, Surreal<Db>> = {
-        let guard = repo_dbs.read().await;
-        guard.clone()
-    }; // read lock dropped HERE — before any async DB queries
-
     let fenced = hydrate_candidates(&db_map, &filtered).await;
     if fenced.dropped > 0 {
         // A vector candidate without a durable chunk row is an index publication
@@ -295,6 +324,14 @@ pub(crate) async fn run_query_with_filters_and_mode(
         return Ok(QueryResult {
             results: vec![],
             pre_rerank_results: vec![],
+            evidence: vec![],
+            decision: decision::decide(
+                &[],
+                &[],
+                true,
+                matches!(graph_mode, QueryGraphMode::VectorOnly),
+                false,
+            ),
             timing: QueryTiming {
                 embed_ms,
                 search_ms,
@@ -541,10 +578,20 @@ pub(crate) async fn run_query_with_filters_and_mode(
         fallback_used: rerank_output.fallback_used,
         skip_reason: rerank_output.skip_reason,
     };
+    let evidence = decision::collect_evidence(&results, res_chunks);
+    let retrieval_decision = decision::decide(
+        &results,
+        &evidence,
+        warming,
+        matches!(graph_mode, QueryGraphMode::VectorOnly),
+        rerank_info.fallback_used,
+    );
 
     Ok(QueryResult {
         results,
         pre_rerank_results,
+        evidence,
+        decision: retrieval_decision,
         timing: QueryTiming {
             embed_ms,
             search_ms,
@@ -997,6 +1044,90 @@ pub fn format_callee_tag(stats: &CallerCalleeStats) -> String {
         format!(" [calls: {} +{} more]", display_names.join(", "), remaining)
     } else {
         format!(" [calls: {}]", display_names.join(", "))
+    }
+}
+
+/// Search the repository's durable chunks for exact text matches. A lexical
+/// lookup is best-effort: semantic retrieval and graph expansion remain valid
+/// when a database is warming or an older index cannot answer the text query.
+async fn lexical_candidates(
+    db_map: &HashMap<String, Surreal<Db>>,
+    repo_filter: Option<&str>,
+    query: &str,
+    limit: usize,
+) -> Vec<LexicalCandidate> {
+    let normalized_filter = repo_filter.map(crate::store::normalize_repo_path);
+    let targets: Vec<&Surreal<Db>> = db_map
+        .iter()
+        .filter(|(repo, _)| {
+            normalized_filter
+                .as_deref()
+                .is_none_or(|filter| repo.as_str() == filter)
+        })
+        .map(|(_, db)| db)
+        .collect();
+
+    let mut candidates = Vec::new();
+    for db in targets {
+        match hybrid::search_db(db, query, limit).await {
+            Ok(mut found) => candidates.append(&mut found),
+            Err(error) => {
+                warn!(error = %error, "hybrid lexical retrieval degraded to semantic results");
+            }
+        }
+    }
+    candidates.sort_by(|a, b| {
+        b.lexical_score
+            .partial_cmp(&a.lexical_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    candidates.truncate(limit);
+    candidates
+}
+
+/// Fuse vector and lexical signals before the existing graph and rerank stages.
+/// The weights intentionally favor semantic similarity while giving exact text
+/// matches enough weight to recover names and paths missed by embeddings.
+fn fuse_retrieval_scores(
+    semantic: &mut Vec<crate::vector::SearchResult>,
+    lexical: Vec<LexicalCandidate>,
+) {
+    let mut lexical_by_key: HashMap<(String, u32, u32), f32> = lexical
+        .into_iter()
+        .map(|candidate| {
+            (
+                (
+                    candidate.result.chunk_id.file.clone(),
+                    candidate.result.chunk_id.line_start,
+                    candidate.result.chunk_id.line_end,
+                ),
+                candidate.lexical_score,
+            )
+        })
+        .collect();
+
+    for result in semantic.iter_mut() {
+        let key = (
+            result.chunk_id.file.clone(),
+            result.chunk_id.line_start,
+            result.chunk_id.line_end,
+        );
+        if let Some(lexical_score) = lexical_by_key.remove(&key) {
+            result.score = (result.score * 0.65 + lexical_score * 0.35).clamp(0.0, 1.0);
+        }
+    }
+
+    for ((file, line_start, line_end), lexical_score) in lexical_by_key {
+        semantic.push(crate::vector::SearchResult {
+            chunk_id: crate::vector::ChunkId {
+                file,
+                line_start,
+                line_end,
+            },
+            // A lexical-only hit is deliberately strong enough to surface, but
+            // remains below a perfect semantic+lexical match.
+            score: (lexical_score * 0.85).clamp(0.0, 1.0),
+        });
     }
 }
 
